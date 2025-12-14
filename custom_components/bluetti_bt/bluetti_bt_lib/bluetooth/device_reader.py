@@ -154,7 +154,7 @@ class DeviceReader:
                                     _LOGGER.warning("Got a parse exception...")
 
             except TimeoutError as err:
-                _LOGGER.error(f"Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                _LOGGER.error(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
                 return None
             except BleakError as err:
                 _LOGGER.error("Bleak error: %s", err)
@@ -209,7 +209,7 @@ class DeviceReader:
             return cast(bytes, res)
 
         except TimeoutError:
-            _LOGGER.debug("Polling single command timed out")
+            _LOGGER.debug("send_command - Polling single command timed out")
         except ModbusError as err:
             _LOGGER.debug(
                 "Got an invalid request error for %s: %s",
@@ -218,6 +218,7 @@ class DeviceReader:
             )
         except (BadConnectionError, BleakError) as err:
             # Ignore other errors
+            _LOGGER.debug("send_command - Bleak Error")
             pass
 
         # caught an exception, return empty bytes object
@@ -225,6 +226,7 @@ class DeviceReader:
 
     async def _async_send_response(self, peer_response):
         """Send response during encryption handshake."""
+        _LOGGER.debug("Sending response during encryption handshake")
         await self.client.write_gatt_char(WRITE_UUID, peer_response)
     
 
@@ -242,7 +244,7 @@ class DeviceReader:
                 if message.type == MessageType.CHALLENGE:
                     _LOGGER.debug("Sending challenge response")
                     challenge_response = self.encryption.msg_challenge(message)
-                    asyncio.create_task(self.send_response(self, challenge_response))
+                    asyncio.create_task(self._async_send_response(challenge_response))
                     #await self.client.write_gatt_char(WRITE_UUID, challenge_response)
                     return
 
@@ -262,7 +264,7 @@ class DeviceReader:
                 if decrypted.type == MessageType.PEER_PUBKEY:
                     _LOGGER.debug("Sending peer public key response")
                     peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
-                    asyncio.create_task(self.send_response(self, peer_pubkey_response))
+                    asyncio.create_task(self._async_send_response(peer_pubkey_response))
                     #await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                     return
 
