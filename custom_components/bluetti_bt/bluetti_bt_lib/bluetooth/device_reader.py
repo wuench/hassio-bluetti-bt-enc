@@ -223,6 +223,11 @@ class DeviceReader:
         # caught an exception, return empty bytes object
         return bytes()
 
+    async def _async_send_response(self, peer_response):
+        """Send response during encryption handshake."""
+        await self.client.write_gatt_char(WRITE_UUID, peer_response)
+    
+
     async def _notification_handler(self, _sender: int, data: bytearray):
         """Handle bt data."""
 
@@ -235,8 +240,10 @@ class DeviceReader:
                 message.verify_checksum()
 
                 if message.type == MessageType.CHALLENGE:
+                    _LOGGER.debug("Sending challenge response")
                     challenge_response = self.encryption.msg_challenge(message)
-                    await self.client.write_gatt_char(WRITE_UUID, challenge_response)
+                    asyncio.create_task(self.send_response(self, challenge_response))
+                    #await self.client.write_gatt_char(WRITE_UUID, challenge_response)
                     return
 
                 if message.type == MessageType.CHALLENGE_ACCEPTED:
@@ -253,8 +260,10 @@ class DeviceReader:
                 decrypted.verify_checksum()
 
                 if decrypted.type == MessageType.PEER_PUBKEY:
+                    _LOGGER.debug("Sending peer public key response")
                     peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
-                    await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
+                    asyncio.create_task(self.send_response(self, peer_pubkey_response))
+                    #await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                     return
 
                 if decrypted.type == MessageType.PUBKEY_ACCEPTED:
