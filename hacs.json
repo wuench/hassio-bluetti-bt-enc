@@ -1,4 +1,9 @@
 {
     "name": "Bluetti BT",
-    "render_readme": true
+    "render_readme": true,
+    "branches": [
+        "main",
+        "dev",
+        "fix-async"
+    ]
 }
