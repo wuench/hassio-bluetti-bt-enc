@@ -155,27 +155,39 @@ class DeviceReader:
 
             except TimeoutError as err:
                 _LOGGER.error(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                _LOGGER.debug("read_data - Disconnecting client due to timeout")
+                await self.client.disconnect()
+                await asyncio.sleep(30)
                 return None
             except BleakError as err:
                 _LOGGER.error("Bleak error: %s", err)
+                _LOGGER.debug("read_data - Disconnecting client due to erro")
+                await self.client.disconnect()
+                await asyncio.sleep(5)
                 return None
             finally:
                 # Disconnect if connection not persistant
                 if not self.persistent_conn:
                     if self.has_notifier:
                         try:
+                            _LOGGER.debug("read_data - Stopping notifier")
                             await self.client.stop_notify(NOTIFY_UUID)
                         except:
                             # Ignore errors here
+                            _LOGGER.debug("read_data - Exception while Stopping notifier")
                             pass
                         self.has_notifier = False
+                    _LOGGER.debug("read_data - Disconnecting client")
                     await self.client.disconnect()
+
 
             # Check if dict is empty
             if not parsed_data:
+                _LOGGER.debug("read_data - Empty data received")
                 return None
 
             # Reset Encryption keys
+            _LOGGER.debug("read_data - Resetting encryption")
             self.encryption.reset()
 
             return parsed_data
