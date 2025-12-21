@@ -81,14 +81,19 @@ class BluettiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
             name = re.sub("[^A-Z0-9]+", "", discovery_info.name)
 
-            return self.async_create_entry(
-                title=name,
-                data={
-                    CONF_ADDRESS: discovery_info.address,
-                    CONF_NAME: name,
-                    CONF_TYPE: discovery_info.manufacturer_data.get(CONF_TYPE, "Unknown"),
-                },
-            )
+            # # NEW CODE BELOW
+            self._discovery_info = discovery_info  # Store for next step
+            return await self.async_step_options()  # Add options step
+
+
+            # return self.async_create_entry(
+            #     title=name,
+            #     data={
+            #         CONF_ADDRESS: discovery_info.address,
+            #         CONF_NAME: name,
+            #         CONF_TYPE: discovery_info.manufacturer_data.get(CONF_TYPE, "Unknown"),
+            #     },
+            # )
 
         if discovery := self._discovery_info:
             self._discovered_devices[discovery.address] = discovery
@@ -125,6 +130,39 @@ class BluettiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Create the options flow."""
         return OptionsFlowHandler(config_entry)
 
+    async def async_step_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Handle advanced options during setup."""
+        if user_input is not None:
+            # Validate inputs
+            if user_input.get(CONF_POLLING_INTERVAL, 20) < 5:
+                return self.async_abort(reason="invalid_interval")
+            
+            discovery_info = self._discovery_info
+            name = re.sub("[^A-Z0-9]+", "", discovery_info.name)
+            
+            return self.async_create_entry(
+                title=name,
+                data={
+                    CONF_ADDRESS: discovery_info.address,
+                    CONF_NAME: name,
+                    CONF_TYPE: discovery_info.manufacturer_data.get(CONF_TYPE, "Unknown"),
+                    **user_input,
+                },
+            )
+
+        return self.async_show_form(
+            step_id="options",
+            data_schema=vol.Schema({
+                vol.Required(CONF_POLLING_INTERVAL, default=20): int,
+                vol.Required(CONF_POLLING_TIMEOUT, default=45): int,
+                vol.Required(CONF_MAX_RETRIES, default=5): int,
+                vol.Required(CONF_ENCRYPTION, default=True): selector.BooleanSelector(),
+                vol.Required(CONF_USE_CONTROLS, default=False): selector.BooleanSelector(),
+                vol.Required(CONF_PERSISTENT_CONN, default=False): selector.BooleanSelector(),
+            }),
+        )
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle a option flow."""
@@ -203,7 +241,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     ): int,
                     vol.Required(
                         CONF_ENCRYPTION,
-                        default=self.config_entry.data.get(CONF_ENCRYPTION, False),
+                        default=self.config_entry.data.get(CONF_ENCRYPTION, True),
                     ): selector.BooleanSelector(),
                 }
             ),

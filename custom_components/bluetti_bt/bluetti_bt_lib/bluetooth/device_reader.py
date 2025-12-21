@@ -154,28 +154,40 @@ class DeviceReader:
                                     _LOGGER.warning("Got a parse exception...")
 
             except TimeoutError as err:
-                _LOGGER.error(f"Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                _LOGGER.error(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                _LOGGER.debug("read_data - Disconnecting client due to timeout")
+                await self.client.disconnect()
+                await asyncio.sleep(30)
                 return None
             except BleakError as err:
                 _LOGGER.error("Bleak error: %s", err)
+                _LOGGER.debug("read_data - Disconnecting client due to erro")
+                await self.client.disconnect()
+                await asyncio.sleep(5)
                 return None
             finally:
                 # Disconnect if connection not persistant
                 if not self.persistent_conn:
                     if self.has_notifier:
                         try:
+                            _LOGGER.debug("read_data - Stopping notifier")
                             await self.client.stop_notify(NOTIFY_UUID)
                         except:
                             # Ignore errors here
+                            _LOGGER.debug("read_data - Exception while Stopping notifier")
                             pass
                         self.has_notifier = False
+                    _LOGGER.debug("read_data - Disconnecting client")
                     await self.client.disconnect()
+
 
             # Check if dict is empty
             if not parsed_data:
+                _LOGGER.debug("read_data - Empty data received")
                 return None
 
             # Reset Encryption keys
+            _LOGGER.debug("read_data - Resetting encryption")
             self.encryption.reset()
 
             return parsed_data
@@ -209,7 +221,7 @@ class DeviceReader:
             return cast(bytes, res)
 
         except TimeoutError:
-            _LOGGER.debug("Polling single command timed out")
+            _LOGGER.debug("send_command - Polling single command timed out")
         except ModbusError as err:
             _LOGGER.debug(
                 "Got an invalid request error for %s: %s",
@@ -218,10 +230,17 @@ class DeviceReader:
             )
         except (BadConnectionError, BleakError) as err:
             # Ignore other errors
+            _LOGGER.debug("send_command - Bleak Error")
             pass
 
         # caught an exception, return empty bytes object
         return bytes()
+
+    async def _async_send_response(self, peer_response):
+        """Send response during encryption handshake."""
+        _LOGGER.debug("Sending response during encryption handshake")
+        await self.client.write_gatt_char(WRITE_UUID, peer_response)
+    
 
     async def _notification_handler(self, _sender: int, data: bytearray):
         """Handle bt data."""
@@ -235,8 +254,10 @@ class DeviceReader:
                 message.verify_checksum()
 
                 if message.type == MessageType.CHALLENGE:
+                    _LOGGER.debug("Sending challenge response")
                     challenge_response = self.encryption.msg_challenge(message)
-                    await self.client.write_gatt_char(WRITE_UUID, challenge_response)
+                    asyncio.create_task(self._async_send_response(challenge_response))
+                    #await self.client.write_gatt_char(WRITE_UUID, challenge_response)
                     return
 
                 if message.type == MessageType.CHALLENGE_ACCEPTED:
@@ -253,8 +274,10 @@ class DeviceReader:
                 decrypted.verify_checksum()
 
                 if decrypted.type == MessageType.PEER_PUBKEY:
+                    _LOGGER.debug("Sending peer public key response")
                     peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
-                    await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
+                    asyncio.create_task(self._async_send_response(peer_pubkey_response))
+                    #await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                     return
 
                 if decrypted.type == MessageType.PUBKEY_ACCEPTED:
