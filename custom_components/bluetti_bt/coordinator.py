@@ -51,11 +51,11 @@ class PollingCoordinator(DataUpdateCoordinator):
         if device is None:
             self.logger.error("Device %s not available", mac_loggable(address))
             return None
-        client = BleakClient(device)
+        #client = BleakClient(device)
         bluetti_device = build_device(address, device_name)
 
         self.reader = DeviceReader(
-            client,
+            device,
             bluetti_device,
             self.hass.loop.create_future,
             persistent_conn=persistent_conn,
