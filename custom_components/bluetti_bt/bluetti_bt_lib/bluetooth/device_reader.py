@@ -10,6 +10,7 @@ from bleak_retry_connector import establish_connection, BleakClientWithServiceCa
 from bleak.backends.device import BLEDevice
 
 from custom_components.bluetti_bt.bluetti_bt_lib.bluetooth.encryption import BluettiEncryption, Message, MessageType
+from cryptography.exceptions import InvalidSignature
 
 from ..base_devices.BluettiDevice import BluettiDevice
 from ..const import NOTIFY_UUID, RESPONSE_TIMEOUT, WRITE_UUID
@@ -94,7 +95,7 @@ class DeviceReader:
                             handshake_start = asyncio.get_event_loop().time()
                             while self.encrypted and not self.encryption.is_ready_for_commands:
                                 if asyncio.get_event_loop().time() - handshake_start > handshake_timeout:
-                                    _LOGGER.error("Encryption handshake timeout")
+                                    _LOGGER.info("Encryption handshake timeout")
                                     return None
                                 await asyncio.sleep(0.5)
                                 _LOGGER.debug("Encryption handshake not finished yet")
@@ -247,7 +248,7 @@ class DeviceReader:
                                         _LOGGER.warning("Got a parse exception...")
 
             except TimeoutError as err:
-                _LOGGER.error(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                _LOGGER.info(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
                 # Always reset notifier flag on timeout for next attempt
                 self.has_notifier = False
                 await asyncio.sleep(30)
@@ -371,9 +372,22 @@ class DeviceReader:
 
                 if decrypted.type == MessageType.PEER_PUBKEY:
                     _LOGGER.debug("Sending peer public key response")
-                    peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    try:
+                        peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    except InvalidSignature:
+                        _LOGGER.warning("Peer public key signature invalid; resetting encryption state")
+                        self.encryption.reset()
+                        return
+                    except Exception as e:
+                        _LOGGER.error("Error processing peer public key: %s", e, exc_info=e)
+                        self.encryption.reset()
+                        return
+
+                    if peer_pubkey_response is None:
+                        _LOGGER.debug("No peer pubkey response generated")
+                        return
+
                     asyncio.create_task(self._async_send_response(peer_pubkey_response))
-                    #await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                     return
 
                 if decrypted.type == MessageType.PUBKEY_ACCEPTED:
