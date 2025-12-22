@@ -44,6 +44,11 @@ class PollingCoordinator(DataUpdateCoordinator):
         )
 
         self.address = address
+        self.device_name = device_name
+        self.persistent_conn = persistent_conn
+        self.polling_timeout = polling_timeout
+        self.max_retries = max_retries
+        self.encrypted = encrypted
 
         # Create client
         self.logger.debug("Creating client")
@@ -75,6 +80,31 @@ class PollingCoordinator(DataUpdateCoordinator):
         if bluetooth.async_address_present(self.hass, self.address, connectable=True) is False:
             self.logger.warning("Device not connected")
             self.last_update_success = False
-            return None
+            raise Exception("Device not connectable")
 
-        return await self.reader.read_data()
+        try:
+            return await self.reader.read_data()
+        except Exception as e:
+            self.logger.error("Error reading data: %s", e, exc_info=e)
+            self.last_update_success = False
+            # Re-raise to let coordinator handle the error and retry
+            raise
+
+    async def async_reset_reader(self):
+        """Reset the device reader after a prolonged failure."""
+        self.logger.info("Resetting device reader")
+        device = bluetooth.async_ble_device_from_address(self.hass, self.address)
+        if device is None:
+            self.logger.error("Device %s not available", mac_loggable(self.address))
+            return
+        
+        bluetti_device = build_device(self.address, self.device_name)
+        self.reader = DeviceReader(
+            device,
+            bluetti_device,
+            self.hass.loop.create_future,
+            persistent_conn=self.persistent_conn,
+            polling_timeout=self.polling_timeout,
+            max_retries=self.max_retries,
+            encrypted=self.encrypted,
+        )

@@ -72,6 +72,11 @@ class DeviceReader:
 
         async with self.polling_lock:
             try:
+                # Reset encryption state at the start for fresh handshake
+                if self.encrypted:
+                    _LOGGER.debug("Resetting encryption for new read cycle")
+                    self.encryption.reset()
+                
                 async with async_timeout.timeout(self.polling_timeout):
                     # Use bleak-retry-connector for transient (non-persistent) connections
                     if not self.persistent_conn:
@@ -79,15 +84,19 @@ class DeviceReader:
                         async with conn as client:
                             self.client = client
 
-                            # Attach notifier if needed
-                            if not self.has_notifier:
-                                await self.client.start_notify(
-                                    NOTIFY_UUID, self._notification_handler
-                                )
-                                self.has_notifier = True
+                            # Attach notifier - always start fresh for non-persistent connections
+                            await self.client.start_notify(
+                                NOTIFY_UUID, self._notification_handler
+                            )
 
+                            # Wait for encryption handshake with timeout
+                            handshake_timeout = 10
+                            handshake_start = asyncio.get_event_loop().time()
                             while self.encrypted and not self.encryption.is_ready_for_commands:
-                                await asyncio.sleep(5)
+                                if asyncio.get_event_loop().time() - handshake_start > handshake_timeout:
+                                    _LOGGER.error("Encryption handshake timeout")
+                                    return None
+                                await asyncio.sleep(0.5)
                                 _LOGGER.debug("Encryption handshake not finished yet")
 
                             # Execute polling commands
@@ -239,40 +248,43 @@ class DeviceReader:
 
             except TimeoutError as err:
                 _LOGGER.error(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
-                _LOGGER.debug("read_data - Disconnecting client due to timeout")
-                await self.client.disconnect()
+                # Always reset notifier flag on timeout for next attempt
+                self.has_notifier = False
                 await asyncio.sleep(30)
                 return None
             except BleakError as err:
                 _LOGGER.error("Bleak error: %s", err)
-                _LOGGER.debug("read_data - Disconnecting client due to erro")
-                await self.client.disconnect()
+                # Always reset notifier flag on Bleak error for next attempt
+                self.has_notifier = False
+                await asyncio.sleep(5)
+                return None
+            except Exception as err:
+                _LOGGER.error("Unexpected error during read_data: %s", err, exc_info=err)
+                # Always reset notifier flag on error for next attempt
+                self.has_notifier = False
                 await asyncio.sleep(5)
                 return None
             finally:
-                # Disconnect if connection not persistant
+                # For non-persistent connections, ensure notifier is properly stopped
                 if not self.persistent_conn:
                     if self.has_notifier:
                         try:
                             _LOGGER.debug("read_data - Stopping notifier")
                             await self.client.stop_notify(NOTIFY_UUID)
-                        except:
-                            # Ignore errors here
-                            _LOGGER.debug("read_data - Exception while Stopping notifier")
-                            pass
-                        self.has_notifier = False
-                    _LOGGER.debug("read_data - Disconnecting client")
-                    await self.client.disconnect()
+                        except Exception as e:
+                            _LOGGER.debug("read_data - Exception while stopping notifier: %s", e)
+                    self.has_notifier = False
+                    try:
+                        _LOGGER.debug("read_data - Disconnecting client")
+                        await self.client.disconnect()
+                    except Exception as e:
+                        _LOGGER.debug("read_data - Exception while disconnecting: %s", e)
 
 
             # Check if dict is empty
             if not parsed_data:
                 _LOGGER.debug("read_data - Empty data received")
                 return None
-
-            # Reset Encryption keys
-            _LOGGER.debug("read_data - Resetting encryption")
-            self.encryption.reset()
 
             return parsed_data
 
