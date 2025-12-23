@@ -4,14 +4,19 @@ import asyncio
 import logging
 from typing import Any, Callable, List, cast
 import async_timeout
-from bleak import BleakClient, BleakError
+
+from bleak import BleakError
+from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
+from bleak.backends.device import BLEDevice
 
 from custom_components.bluetti_bt.bluetti_bt_lib.bluetooth.encryption import BluettiEncryption, Message, MessageType
+from cryptography.exceptions import InvalidSignature
 
 from ..base_devices.BluettiDevice import BluettiDevice
 from ..const import NOTIFY_UUID, RESPONSE_TIMEOUT, WRITE_UUID
 from ..exceptions import BadConnectionError, ModbusError, ParseError
 from ..utils.commands import ReadHoldingRegisters
+from homeassistant.components import bluetooth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,7 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 class DeviceReader:
     def __init__(
         self,
-        bleak_client: BleakClient,
+        device: BLEDevice,
         bluetti_device: BluettiDevice,
         future_builder_method: Callable[[], asyncio.Future[Any]],
         persistent_conn: bool = False,
@@ -27,7 +32,9 @@ class DeviceReader:
         max_retries: int = 5,
         encrypted: bool = False,
     ) -> None:
-        self.client = bleak_client
+        # use BleakClientWithServiceCache from bleak-retry-connector
+        self.client = BleakClientWithServiceCache(device)
+        self.device = device
         self.bluetti_device = bluetti_device
         self.create_future = future_builder_method
         self.persistent_conn = persistent_conn
@@ -66,129 +73,219 @@ class DeviceReader:
 
         async with self.polling_lock:
             try:
+                # Reset encryption state at the start for fresh handshake
+                if self.encrypted:
+                    _LOGGER.debug("Resetting encryption for new read cycle")
+                    self.encryption.reset()
+                
                 async with async_timeout.timeout(self.polling_timeout):
-                    # Reconnect if not connected
-                    for attempt in range(1, self.max_retries + 1):
-                        try:
-                            if not self.client.is_connected:
-                                await self.client.connect()
-                            break
-                        except Exception as e:
-                            if attempt == self.max_retries:
-                                raise e # pass exception on max_retries attempt
-                            else:
-                                _LOGGER.warning(
-                                    f"Connect unsucessful (attempt {attempt}): {e}. Retrying..."
-                                )
-                                await asyncio.sleep(2)
+                    # Use bleak-retry-connector for transient (non-persistent) connections
+                    if not self.persistent_conn:
+                        conn = await establish_connection(BleakClientWithServiceCache, self.device, self.device.name)
+                        async with conn as client:
+                            self.client = client
 
-                    # Attach notifier if needed
-                    if not self.has_notifier:
-                        await self.client.start_notify(
-                            NOTIFY_UUID, self._notification_handler
-                        )
-                        self.has_notifier = True
-
-                    while self.encrypted and not self.encryption.is_ready_for_commands:
-                        await asyncio.sleep(5)
-                        _LOGGER.debug("Encryption handshake not finished yet")
-
-                    # Execute polling commands
-                    for command in polling_commands:
-                        try:
-                            body = command.parse_response(
-                                await self._async_send_command(command)
+                            # Attach notifier - always start fresh for non-persistent connections
+                            await self.client.start_notify(
+                                NOTIFY_UUID, self._notification_handler
                             )
-                            _LOGGER.debug("Raw data: %s", body)
-                            parsed = self.bluetti_device.parse(
-                                command.starting_address, body
-                            )
-                            _LOGGER.debug("Parsed data: %s", parsed)
-                            parsed_data.update(parsed)
-                        except ParseError:
-                            _LOGGER.warning("Got a parse exception")
 
-                    # Execute pack polling commands
-                    if len(pack_commands) > 0 and len(self.bluetti_device.pack_num_field) == 1:
-                        _LOGGER.debug("Polling battery packs")
-                        for pack in range(1, self.bluetti_device.pack_num_max + 1):
-                            _LOGGER.debug("Setting pack_num to %i", pack)
+                            # Wait for encryption handshake with timeout
+                            handshake_timeout = 10
+                            handshake_start = asyncio.get_event_loop().time()
+                            while self.encrypted and not self.encryption.is_ready_for_commands:
+                                if asyncio.get_event_loop().time() - handshake_start > handshake_timeout:
+                                    _LOGGER.info("Encryption handshake timeout")
+                                    return None
+                                await asyncio.sleep(0.5)
+                                _LOGGER.debug("Encryption handshake not finished yet")
 
-                            # Set current pack number
-                            command = self.bluetti_device.build_setter_command(
-                                "pack_num", pack
-                            )
-                            body = command.parse_response(
-                                await self._async_send_command(command)
-                            )
-                            _LOGGER.debug("Raw data set: %s", body)
-
-                            # Check set pack_num
-                            set_pack = int.from_bytes(body, byteorder='big')
-                            if set_pack is not pack:
-                                _LOGGER.warning("Pack polling failed (pack_num %i doesn't match expected %i)", set_pack, pack)
-                                continue
-
-                            if self.bluetti_device.pack_num_max > 1:
-                                # We need to wait after switching packs 
-                                # for the data to be available
-                                await asyncio.sleep(5)
-                            
-                            for command in pack_commands:
-                                # Request & parse result for each pack
+                            # Execute polling commands
+                            for command in polling_commands:
                                 try:
                                     body = command.parse_response(
                                         await self._async_send_command(command)
                                     )
+                                    _LOGGER.debug("Raw data: %s", body)
                                     parsed = self.bluetti_device.parse(
                                         command.starting_address, body
                                     )
                                     _LOGGER.debug("Parsed data: %s", parsed)
-
-                                    for key, value in parsed.items():
-                                        # Ignore likely unavailable pack data
-                                        if value != 0:
-                                            parsed_data.update({key + str(pack): value})
-
+                                    parsed_data.update(parsed)
                                 except ParseError:
-                                    _LOGGER.warning("Got a parse exception...")
+                                    _LOGGER.warning("Got a parse exception")
+
+                            # Execute pack polling commands
+                            if len(pack_commands) > 0 and len(self.bluetti_device.pack_num_field) == 1:
+                                _LOGGER.debug("Polling battery packs")
+                                for pack in range(1, self.bluetti_device.pack_num_max + 1):
+                                    _LOGGER.debug("Setting pack_num to %i", pack)
+
+                                    # Set current pack number
+                                    command = self.bluetti_device.build_setter_command(
+                                        "pack_num", pack
+                                    )
+                                    body = command.parse_response(
+                                        await self._async_send_command(command)
+                                    )
+                                    _LOGGER.debug("Raw data set: %s", body)
+
+                                    # Check set pack_num
+                                    set_pack = int.from_bytes(body, byteorder='big')
+                                    if set_pack is not pack:
+                                        _LOGGER.warning("Pack polling failed (pack_num %i doesn't match expected %i)", set_pack, pack)
+                                        continue
+
+                                    if self.bluetti_device.pack_num_max > 1:
+                                        # We need to wait after switching packs 
+                                        # for the data to be available
+                                        await asyncio.sleep(5)
+
+                                    for command in pack_commands:
+                                        # Request & parse result for each pack
+                                        try:
+                                            body = command.parse_response(
+                                                await self._async_send_command(command)
+                                            )
+                                            parsed = self.bluetti_device.parse(
+                                                command.starting_address, body
+                                            )
+                                            _LOGGER.debug("Parsed data: %s", parsed)
+
+                                            for key, value in parsed.items():
+                                                # Ignore likely unavailable pack data
+                                                if value != 0:
+                                                    parsed_data.update({key + str(pack): value})
+
+                                        except ParseError:
+                                            _LOGGER.warning("Got a parse exception...")
+                    
+                    else:
+                        # persistent connection: keep using existing client instance and retry connect manually
+                        for attempt in range(1, self.max_retries + 1):
+                            try:
+                                if not self.client.is_connected:
+                                    await self.client.connect()
+                                break
+                            except Exception as e:
+                                if attempt == self.max_retries:
+                                    raise e
+                                else:
+                                    _LOGGER.warning(
+                                        f"Connect unsucessful (attempt {attempt}): {e}. Retrying..."
+                                    )
+                                    await asyncio.sleep(2)
+
+                        # Attach notifier if needed
+                        if not self.has_notifier:
+                            await self.client.start_notify(
+                                NOTIFY_UUID, self._notification_handler
+                            )
+                            self.has_notifier = True
+
+                        while self.encrypted and not self.encryption.is_ready_for_commands:
+                            await asyncio.sleep(5)
+                            _LOGGER.debug("Encryption handshake not finished yet")
+
+                        # Execute polling commands
+                        for command in polling_commands:
+                            try:
+                                body = command.parse_response(
+                                    await self._async_send_command(command)
+                                )
+                                _LOGGER.debug("Raw data: %s", body)
+                                parsed = self.bluetti_device.parse(
+                                    command.starting_address, body
+                                )
+                                _LOGGER.debug("Parsed data: %s", parsed)
+                                parsed_data.update(parsed)
+                            except ParseError:
+                                _LOGGER.warning("Got a parse exception")
+
+                        # Execute pack polling commands
+                        if len(pack_commands) > 0 and len(self.bluetti_device.pack_num_field) == 1:
+                            _LOGGER.debug("Polling battery packs")
+                            for pack in range(1, self.bluetti_device.pack_num_max + 1):
+                                _LOGGER.debug("Setting pack_num to %i", pack)
+
+                                # Set current pack number
+                                command = self.bluetti_device.build_setter_command(
+                                    "pack_num", pack
+                                )
+                                body = command.parse_response(
+                                    await self._async_send_command(command)
+                                )
+                                _LOGGER.debug("Raw data set: %s", body)
+
+                                # Check set pack_num
+                                set_pack = int.from_bytes(body, byteorder='big')
+                                if set_pack is not pack:
+                                    _LOGGER.warning("Pack polling failed (pack_num %i doesn't match expected %i)", set_pack, pack)
+                                    continue
+
+                                if self.bluetti_device.pack_num_max > 1:
+                                    # We need to wait after switching packs 
+                                    # for the data to be available
+                                    await asyncio.sleep(5)
+                                
+                                for command in pack_commands:
+                                    # Request & parse result for each pack
+                                    try:
+                                        body = command.parse_response(
+                                            await self._async_send_command(command)
+                                        )
+                                        parsed = self.bluetti_device.parse(
+                                            command.starting_address, body
+                                        )
+                                        _LOGGER.debug("Parsed data: %s", parsed)
+
+                                        for key, value in parsed.items():
+                                            # Ignore likely unavailable pack data
+                                            if value != 0:
+                                                parsed_data.update({key + str(pack): value})
+
+                                    except ParseError:
+                                        _LOGGER.warning("Got a parse exception...")
 
             except TimeoutError as err:
-                _LOGGER.error(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
-                _LOGGER.debug("read_data - Disconnecting client due to timeout")
-                await self.client.disconnect()
+                _LOGGER.info(f"read_data - Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                # Always reset notifier flag on timeout for next attempt
+                self.has_notifier = False
                 await asyncio.sleep(30)
                 return None
             except BleakError as err:
                 _LOGGER.error("Bleak error: %s", err)
-                _LOGGER.debug("read_data - Disconnecting client due to erro")
-                await self.client.disconnect()
+                # Always reset notifier flag on Bleak error for next attempt
+                self.has_notifier = False
+                await asyncio.sleep(5)
+                return None
+            except Exception as err:
+                _LOGGER.error("Unexpected error during read_data: %s", err, exc_info=err)
+                # Always reset notifier flag on error for next attempt
+                self.has_notifier = False
                 await asyncio.sleep(5)
                 return None
             finally:
-                # Disconnect if connection not persistant
+                # For non-persistent connections, ensure notifier is properly stopped
                 if not self.persistent_conn:
                     if self.has_notifier:
                         try:
                             _LOGGER.debug("read_data - Stopping notifier")
                             await self.client.stop_notify(NOTIFY_UUID)
-                        except:
-                            # Ignore errors here
-                            _LOGGER.debug("read_data - Exception while Stopping notifier")
-                            pass
-                        self.has_notifier = False
-                    _LOGGER.debug("read_data - Disconnecting client")
-                    await self.client.disconnect()
+                        except Exception as e:
+                            _LOGGER.debug("read_data - Exception while stopping notifier: %s", e)
+                    self.has_notifier = False
+                    try:
+                        _LOGGER.debug("read_data - Disconnecting client")
+                        await self.client.disconnect()
+                    except Exception as e:
+                        _LOGGER.debug("read_data - Exception while disconnecting: %s", e)
 
 
             # Check if dict is empty
             if not parsed_data:
                 _LOGGER.debug("read_data - Empty data received")
                 return None
-
-            # Reset Encryption keys
-            _LOGGER.debug("read_data - Resetting encryption")
-            self.encryption.reset()
 
             return parsed_data
 
@@ -275,9 +372,22 @@ class DeviceReader:
 
                 if decrypted.type == MessageType.PEER_PUBKEY:
                     _LOGGER.debug("Sending peer public key response")
-                    peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    try:
+                        peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    except InvalidSignature:
+                        _LOGGER.warning("Peer public key signature invalid; resetting encryption state")
+                        self.encryption.reset()
+                        return
+                    except Exception as e:
+                        _LOGGER.error("Error processing peer public key: %s", e, exc_info=e)
+                        self.encryption.reset()
+                        return
+
+                    if peer_pubkey_response is None:
+                        _LOGGER.debug("No peer pubkey response generated")
+                        return
+
                     asyncio.create_task(self._async_send_response(peer_pubkey_response))
-                    #await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                     return
 
                 if decrypted.type == MessageType.PUBKEY_ACCEPTED:

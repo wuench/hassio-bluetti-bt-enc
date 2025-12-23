@@ -59,7 +59,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Create coordinator for polling
     _LOGGER.debug("Creating coordinator")
     coordinator = PollingCoordinator(hass, address, device_name, polling_interval, persistent_conn, polling_timeout, max_retries, use_encryption)
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as e:
+        _LOGGER.error("Failed to initialize coordinator: %s", e, exc_info=e)
+        raise ConfigEntryNotReady("Failed to initialize coordinator") from e
     hass.data[DOMAIN][entry.entry_id].setdefault(DATA_COORDINATOR, coordinator)
 
     _LOGGER.debug("Creating entities")
